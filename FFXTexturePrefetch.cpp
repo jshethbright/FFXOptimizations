@@ -631,6 +631,8 @@ void report(const fs::path& path, Bytes warmed, unsigned files, bool opens, bool
 void runWorker(const fs::path& game)
 {
     const auto conf = game / L"modules\\config\\ff10-file-loader.ini";
+    const auto settings = game / L"modules\\config\\FFXTexturePrefetch.ini";
+    const bool diagnostics = GetPrivateProfileIntW(L"Diagnostics", L"Logging", 1, settings.c_str()) != 0;
     const auto log = game / L"ffx-texture-prefetch.log";
     const auto hotPath = game / L"modules\\config\\FFXTexturePrefetch.hot";
     const auto slowPath = game / L"ffx-texture-slow-reads.log";
@@ -646,7 +648,7 @@ void runWorker(const fs::path& game)
         if (!loader) Sleep(20);
     }
     if (!loader) {
-        std::ofstream(log, std::ios::app) << "External File Loader was not detected.\n";
+        if (diagnostics) std::ofstream(log, std::ios::app) << "External File Loader was not detected.\n";
         if (ioEvent) CloseHandle(ioEvent);
         CloseHandle(wake);
         return;
@@ -689,7 +691,7 @@ void runWorker(const fs::path& game)
     Bytes warmed = 0;
     unsigned files = 0;
     auto lastReport = GetTickCount64();
-    report(log, warmed, files, opens, attrs, read);
+    if (diagnostics) report(log, warmed, files, opens, attrs, read);
 
     for (;;) {
         Observation request{};
@@ -708,14 +710,16 @@ void runWorker(const fs::path& game)
                     learned = true;
                 }
                 queueGeneralTexture(jobs, roots, asset, generalQueued, generalAllowance);
-                SYSTEMTIME now{};
-                GetLocalTime(&now);
-                std::wofstream slow(slowPath, std::ios::app);
-                slow << now.wHour << L":" << now.wMinute << L":" << now.wSecond
-                     << L" uptime_ms=" << GetTickCount64()
-                     << L" elapsed_us=" << request.readUs << L" bytes=" << request.readBytes
-                     << L" end_qpc=" << request.readQpc << L" thread=" << request.thread
-                     << L" asset=" << asset << L"\n";
+                if (diagnostics) {
+                    SYSTEMTIME now{};
+                    GetLocalTime(&now);
+                    std::wofstream slow(slowPath, std::ios::app);
+                    slow << now.wHour << L":" << now.wMinute << L":" << now.wSecond
+                         << L" uptime_ms=" << GetTickCount64()
+                         << L" elapsed_us=" << request.readUs << L" bytes=" << request.readBytes
+                         << L" end_qpc=" << request.readQpc << L" thread=" << request.thread
+                         << L" asset=" << asset << L"\n";
+                }
                 continue;
             }
             if (request.opened) cached.insert(asset);
@@ -767,7 +771,7 @@ void runWorker(const fs::path& game)
             WaitForSingleObject(wake, 250);
         }
 
-        if (GetTickCount64() - lastReport >= 5000) {
+        if (diagnostics && GetTickCount64() - lastReport >= 5000) {
             report(log, warmed, files, opens, attrs, read);
             lastReport = GetTickCount64();
         }
@@ -790,7 +794,7 @@ void runWorker(const fs::path& game)
 #ifndef FFX_PREFETCH_TEST
 struct ModuleVersion { int major, minor, patch; };
 extern "C" __declspec(dllexport) const char* FF10HgetName() { return "FFX Texture Prefetch Beta"; }
-extern "C" __declspec(dllexport) ModuleVersion FF10HgetVer() { return {0, 6, 0}; }
+extern "C" __declspec(dllexport) ModuleVersion FF10HgetVer() { return {0, 6, 1}; }
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {

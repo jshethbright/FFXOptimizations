@@ -17,6 +17,13 @@ A cache hit returns resident bytes and advances the native file pointer. FFX use
 3. With FFX closed, copy `build\FFXTexturePrefetch.dll` to the game's `modules` folder beside `ff10-file-loader.dll`. The game needs a module loader and a working build of External File Loader for its executable version. [External File Loader source](https://github.com/WanxTitanx/ffx-external-file-loader)
 4. Start FFX and check `ffx-texture-prefetch.log` in the game directory. The log records hook status, slow reads, resident cache size and hits, and separate counts, bytes, and worst latency for reads through the native Windows path.
 
+To disable the texture logs, create `modules\config\FFXTexturePrefetch.ini` in the game directory with the following settings. The worker still learns which textures to queue.
+
+```ini
+[Diagnostics]
+Logging=0
+```
+
 To remove it, close the game and move `FFXTexturePrefetch.dll` out of `modules`.
 
 ### Validate without launching FFX
