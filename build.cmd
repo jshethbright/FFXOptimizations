@@ -11,4 +11,8 @@ if not exist "%OUT%" mkdir "%OUT%"
 cl /nologo /W4 /WX /EHsc /std:c++17 /O2 /MT /LD /Fo"%OUT%\FFXTexturePrefetch.obj" "%ROOT%FFXTexturePrefetch.cpp" /link /IMPLIB:"%OUT%\FFXTexturePrefetch.lib" /OUT:"%OUT%\FFXTexturePrefetch.dll"
 if errorlevel 1 exit /b 1
 cl /nologo /W4 /WX /EHsc /std:c++17 /O2 /MT /DFFX_PREFETCH_TEST /Fo"%OUT%\prefetch-test.obj" /Fe"%OUT%\prefetch-test.exe" "%ROOT%FFXTexturePrefetch.cpp"
+if errorlevel 1 exit /b 1
+cl /nologo /W4 /WX /EHsc /std:c++17 /O2 /MT /LD /Fo"%OUT%\FFXRuntimeFixes.obj" "%ROOT%FFXRuntimeFixes.cpp" /link user32.lib gdi32.lib /IMPLIB:"%OUT%\FFXRuntimeFixes.lib" /OUT:"%OUT%\FFXRuntimeFixes.dll"
+if errorlevel 1 exit /b 1
+cl /nologo /W4 /WX /EHsc /std:c++17 /O2 /MT /DFFX_RUNTIME_FIXES_TEST /Fo"%OUT%\runtime-fixes-test.obj" /Fe"%OUT%\runtime-fixes-test.exe" "%ROOT%FFXRuntimeFixes.cpp" /link user32.lib gdi32.lib
 exit /b %ERRORLEVEL%

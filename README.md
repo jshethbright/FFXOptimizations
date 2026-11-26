@@ -41,6 +41,15 @@ $menu = New-Item -ItemType Directory -Path (Join-Path $fixture 'menu')
 
 Offline validation verifies file behavior, including a normal texture that first falls through to the native reader and later hits the cache. Gameplay performance depends on when predicted textures finish loading.
 
+## Optional startup and battle fixes
+
+Copy `build/FFXRuntimeFixes.dll` into the game's `modules` folder to enable these fixes through the FFX module loader.
+
+- The game window uses a black background while Direct3D starts. The hook targets the Phyre game window and chains existing window-class hooks.
+- The optional battle sound cue reader skips inaccessible records and forwards valid sound IDs to the game's audio engine. This fix works independently of the FPS mod and checks the expected instructions before patching.
+
+Run `build/runtime-fixes-test.exe "path/to/FFX.exe"` to validate the sound patch against your executable and check the black window class. The test maps the executable as test data and leaves the game unopened.
+
 ## Optional texture and frame profiler
 
 FFXGpuTextureTrace is a 32-bit ReShade add-on. It records frame and Present timing, CPU time for texture and shader creation, and sampled GPU texture transfers when the D3D11 context hook attaches. It also logs local video memory usage and budget when the DXGI adapter exposes them. CPU creation with initial data includes driver work. GPU timestamp samples cover explicit updates and copies.
