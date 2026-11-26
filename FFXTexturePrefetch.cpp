@@ -28,6 +28,9 @@ constexpr Bytes sessionBudget = 2048 * mib;
 constexpr Bytes maxTexture = 48 * mib;
 constexpr Bytes residentBudget = 1024 * mib;
 constexpr size_t maxResidentFiles = 128;
+constexpr Bytes generalResidentBudget = 256 * mib;
+constexpr size_t maxGeneralResidentFiles = 48;
+constexpr Bytes newGeneralBudget = 128 * mib;
 constexpr size_t maxPath = 768;
 constexpr wchar_t assetRoot[] = L"ffx_data\\gamedata\\ps3data\\";
 using OpenFile = decltype(&CreateFileW);
@@ -44,7 +47,8 @@ std::array<std::atomic<HANDLE>, 2048> handles{};
 LARGE_INTEGER frequency{};
 std::atomic<unsigned> readCalls{0}, slowReads{0}, slowOpens{0}, maxReadUs{0}, maxOpenUs{0};
 std::atomic<Bytes> bytesRead{0}, residentBytesRead{0}, residentBytes{0};
-std::atomic<unsigned> residentHits{0};
+std::atomic<unsigned> residentHits{0}, generalHits{0}, nativeCalls{0}, maxNativeReadUs{0};
+std::atomic<Bytes> generalResidentBytes{0}, nativeReadBytes{0};
 std::atomic<std::uint64_t> lastTextureRead{0};
 
 // The actual file identity prevents aliases and a replaced override from serving
@@ -69,8 +73,11 @@ FileStamp inspectFile(HANDLE file)
             (ULONGLONG(info.nFileSizeHigh) << 32) | info.nFileSizeLow};
 }
 
+enum class JobKind { Warm, Battle, General };
+
 struct ResidentTexture {
     FileStamp stamp;
+    JobKind kind = JobKind::Battle;
     std::unique_ptr<BYTE[]> data;
     std::atomic<ULONGLONG> lastUsed{0};
 };
@@ -130,6 +137,7 @@ bool readResident(HANDLE file, const FileStamp& stamp, void* buffer, DWORD count
     *actual = count;
     texture->lastUsed.store(GetTickCount64(), std::memory_order_relaxed);
     residentHits.fetch_add(1, std::memory_order_relaxed);
+    if (texture->kind == JobKind::General) generalHits.fetch_add(1, std::memory_order_relaxed);
     residentBytesRead.fetch_add(count, std::memory_order_relaxed);
     return true;
 }
@@ -152,15 +160,6 @@ bool isTexture(const wchar_t* path, size_t length)
     constexpr wchar_t suffix[] = L".dds.phyre";
     return length >= std::size(suffix) - 1 &&
            _wcsicmp(path + length - std::size(suffix) + 1, suffix) == 0;
-}
-
-bool isBattleTexturePath(const wchar_t* path)
-{
-    for (auto* part = path; part && *part; ++part) {
-        if ((*part == L'\\' || *part == L'/') && _wcsnicmp(part + 1, L"btlmap", 6) == 0 &&
-            (part[7] == L'\\' || part[7] == L'/')) return true;
-    }
-    return false;
 }
 
 bool mayBeMap(const wchar_t* path)
@@ -226,8 +225,7 @@ HANDLE WINAPI openHook(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRI
         handleSlot(result).store(result, std::memory_order_relaxed);
         const bool eligible = (access == GENERIC_READ || access == FILE_READ_DATA) &&
                               !(share & (FILE_SHARE_WRITE | FILE_SHARE_DELETE)) &&
-                              !(flags & (FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING)) &&
-                              isBattleTexturePath(path);
+                              !(flags & (FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING));
         rememberName(result, path, length, eligible ? inspectFile(result) : FileStamp{});
         observe(path, length, true);
     }
@@ -260,9 +258,16 @@ BOOL WINAPI readHook(HANDLE file, LPVOID buffer, DWORD count, LPDWORD actual, LP
     auto& serial = fileReadLocks[nameSlot(file) % fileReadLocks.size()];
     if (stamp.size) AcquireSRWLockExclusive(&serial);
     const bool served = stamp.size && readResident(file, stamp, buffer, count, actual);
+    LARGE_INTEGER nativeStart{};
+    if (track && !served) QueryPerformanceCounter(&nativeStart);
     SetLastError(errorBefore);
     const BOOL result = served ? TRUE : originalRead(file, buffer, count, actual, overlapped);
     const auto error = GetLastError();
+    if (track && !served) {
+        maximum(maxNativeReadUs, elapsedUs(nativeStart));
+        nativeCalls.fetch_add(1, std::memory_order_relaxed);
+        if (result && actual) nativeReadBytes.fetch_add(*actual, std::memory_order_relaxed);
+    }
     if (stamp.size) ReleaseSRWLockExclusive(&serial);
     if (track) {
         const auto elapsed = elapsedUs(start);
@@ -362,7 +367,17 @@ std::vector<fs::path> getRoots(const fs::path& config, const fs::path& game)
 }
 
 struct Texture { fs::path relative; Bytes size; };
-struct Job { std::deque<Texture> textures; Bytes remaining; bool retain = false; };
+struct Job { std::deque<Texture> textures; Bytes remaining; JobKind kind = JobKind::Warm; };
+
+Bytes sizeOfTexture(const std::vector<fs::path>& roots, const fs::path& relative)
+{
+    for (const auto& root : roots) {
+        std::error_code error;
+        const auto size = fs::file_size(root / relative, error);
+        if (!error) return size <= maxTexture ? size : 0;
+    }
+    return 0;
+}
 
 void addTree(Job& job, const fs::path& root, const fs::path& relative)
 {
@@ -414,24 +429,39 @@ void saveHotSet(const fs::path& path, const SlowTextures& hotSet)
 
 Job hotJob(const std::vector<fs::path>& roots, const SlowTextures& hotSet, bool battle)
 {
-    Job job{{}, battle ? residentBudget : 384 * mib, battle};
+    Job job{{}, battle ? residentBudget : generalResidentBudget,
+            battle ? JobKind::Battle : JobKind::General};
     std::vector<std::pair<std::wstring,unsigned>> sorted(hotSet.begin(), hotSet.end());
     std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
         return a.second > b.second;
     });
+    const auto maxFiles = battle ? maxResidentFiles : maxGeneralResidentFiles;
+    Bytes plannedBytes = 0;
     for (const auto& entry : sorted) {
         const fs::path relative(entry.first);
         if ((entry.first.rfind(L"btlmap\\", 0) == 0) != battle) continue;
-        for (const auto& root : roots) {
-            std::error_code error;
-            const auto size = fs::file_size(root / relative, error);
-            if (!error) {
-                if (size && size <= maxTexture) job.textures.push_back({relative, size});
-                break;
-            }
-        }
+        const auto size = sizeOfTexture(roots, relative);
+        if (!size || size > job.remaining - plannedBytes) continue;
+        job.textures.push_back({relative, size});
+        plannedBytes += size;
+        if (job.textures.size() == maxFiles) break;
     }
     return job;
+}
+
+void queueGeneralTexture(std::deque<Job>& jobs, const std::vector<fs::path>& roots,
+                         const std::wstring& asset, std::unordered_set<std::wstring>& queued, Bytes& allowance)
+{
+    if (!allowance || queued.size() >= 2 * maxGeneralResidentFiles || !endsWith(asset, L".dds.phyre") || asset.rfind(L"btlmap\\", 0) == 0 ||
+        queued.find(asset) != queued.end()) return;
+    const fs::path relative(asset);
+    const auto size = sizeOfTexture(roots, relative);
+    if (!size || size > allowance) return;
+    queued.insert(asset);
+    allowance -= size;
+    const auto beforeWarm = std::find_if(jobs.begin(), jobs.end(),
+        [](const auto& job) { return job.kind == JobKind::Warm; });
+    jobs.insert(beforeWarm, Job{{Texture{relative, size}}, size, JobKind::General});
 }
 
 void addAreaJobs(std::deque<Job>& jobs, const std::vector<fs::path>& roots, const std::wstring& asset,
@@ -448,7 +478,7 @@ void addAreaJobs(std::deque<Job>& jobs, const std::vector<fs::path>& roots, cons
     if (stage.compare(0, 4, area) != 0 || stage[4] < L'0' || stage[4] > L'9' ||
         stage[5] < L'0' || stage[5] > L'9' || !planned.insert(stage).second) return;
 
-    Job job{{}, 384 * mib, true};
+    Job job{{}, 384 * mib, JobKind::Battle};
     for (const auto& root : roots) {
         const auto folder = fs::path(L"btlmap") / area;
         std::error_code error;
@@ -471,7 +501,7 @@ void addAreaJobs(std::deque<Job>& jobs, const std::vector<fs::path>& roots, cons
 
 // The worker submits offset-zero overlapped I/O for the complete texture.
 // Only fully completed files become visible to the consumer.
-Bytes loadResident(const fs::path& path, Bytes limit, HANDLE ioEvent)
+Bytes loadResident(const fs::path& path, Bytes limit, HANDLE ioEvent, JobKind kind)
 {
     auto texture = std::make_shared<ResidentTexture>();
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -494,7 +524,20 @@ Bytes loadResident(const fs::path& path, Bytes limit, HANDLE ioEvent)
         return 0;
     }
 
+    // Only the worker changes cache membership. Check protected battle space before doing I/O.
+    const bool general = kind == JobKind::General;
+    if (general) {
+        const auto battleBytes = residentBytes.load() - generalResidentBytes.load();
+        const auto battleFiles = std::count_if(residentTextures.begin(), residentTextures.end(),
+            [](const auto& entry) { return entry->kind == JobKind::Battle; });
+        if (battleBytes + stamp.size > residentBudget || battleFiles >= maxResidentFiles) {
+            CloseHandle(file);
+            return 0;
+        }
+    }
+
     texture->stamp = stamp;
+    texture->kind = kind;
     texture->data.reset(new (std::nothrow) BYTE[static_cast<size_t>(stamp.size)]);
     if (!texture->data) {
         CloseHandle(file);
@@ -516,22 +559,31 @@ Bytes loadResident(const fs::path& path, Bytes limit, HANDLE ioEvent)
     size_t evicted = 0;
     AcquireSRWLockExclusive(&residentLock);
     auto bytes = residentBytes.load(std::memory_order_relaxed);
-    while (bytes + stamp.size > residentBudget && !residentTextures.empty()) {
-        const auto oldest = std::min_element(residentTextures.begin(), residentTextures.end(),
-            [](const auto& a, const auto& b) {
-                return a->lastUsed.load(std::memory_order_relaxed) < b->lastUsed.load(std::memory_order_relaxed);
-            });
+    auto generalBytes = generalResidentBytes.load(std::memory_order_relaxed);
+    auto generalFiles = std::count_if(residentTextures.begin(), residentTextures.end(),
+        [](const auto& entry) { return entry->kind == JobKind::General; });
+    while (bytes + stamp.size > residentBudget || residentTextures.size() == maxResidentFiles ||
+           (general && (generalBytes + stamp.size > generalResidentBudget ||
+                        generalFiles >= maxGeneralResidentFiles))) {
+        auto oldest = residentTextures.end();
+        for (auto it = residentTextures.begin(); it != residentTextures.end(); ++it) {
+            if (general && (*it)->kind == JobKind::Battle) continue;
+            if (oldest == residentTextures.end() ||
+                (*it)->lastUsed.load(std::memory_order_relaxed) < (*oldest)->lastUsed.load(std::memory_order_relaxed))
+                oldest = it;
+        }
+        if (oldest == residentTextures.end()) break;
         bytes -= (*oldest)->stamp.size;
+        if ((*oldest)->kind == JobKind::General) {
+            generalBytes -= (*oldest)->stamp.size;
+            --generalFiles;
+        }
         retired[evicted++] = std::move(*oldest);
         residentTextures.erase(oldest);
     }
-    if (residentTextures.size() == maxResidentFiles) {
-        bytes -= residentTextures.front()->stamp.size;
-        retired[evicted++] = std::move(residentTextures.front());
-        residentTextures.erase(residentTextures.begin());
-    }
     residentTextures.push_back(std::move(texture));
     residentBytes.store(bytes + stamp.size, std::memory_order_relaxed);
+    generalResidentBytes.store(generalBytes + (general ? stamp.size : 0), std::memory_order_relaxed);
     ReleaseSRWLockExclusive(&residentLock);
     return stamp.size;
 }
@@ -569,6 +621,10 @@ void report(const fs::path& path, Bytes warmed, unsigned files, bool opens, bool
         << " max_open_us=" << maxOpenUs.exchange(0) << " opens_over_2ms=" << slowOpens.exchange(0)
         << " resident_bytes=" << residentBytes.load() << " resident_hits=" << residentHits.exchange(0)
         << " resident_read_bytes=" << residentBytesRead.exchange(0)
+        << " general_resident_bytes=" << generalResidentBytes.load()
+        << " general_resident_hits=" << generalHits.exchange(0)
+        << " native_read_calls=" << nativeCalls.exchange(0) << " native_read_bytes=" << nativeReadBytes.exchange(0)
+        << " max_native_read_us=" << maxNativeReadUs.exchange(0)
         << '\n';
 }
 
@@ -609,7 +665,10 @@ void runWorker(const fs::path& game)
     auto battleHot = hotJob(roots, hotSet, true);
     if (!battleHot.textures.empty()) jobs.push_back(std::move(battleHot));
     auto prioritized = hotJob(roots, hotSet, false);
+    std::unordered_set<std::wstring> generalQueued;
+    for (const auto& texture : prioritized.textures) generalQueued.insert(texture.relative.native());
     if (!prioritized.textures.empty()) jobs.push_back(std::move(prioritized));
+    Bytes generalAllowance = newGeneralBudget;
     bool learned = false;
     auto lastSave = GetTickCount64();
     const auto addStartup = [&](const wchar_t* path, Bytes budget, bool largestFirst) {
@@ -648,6 +707,7 @@ void runWorker(const fs::path& game)
                     score = request.readUs;
                     learned = true;
                 }
+                queueGeneralTexture(jobs, roots, asset, generalQueued, generalAllowance);
                 SYSTEMTIME now{};
                 GetLocalTime(&now);
                 std::wofstream slow(slowPath, std::ios::app);
@@ -670,7 +730,8 @@ void runWorker(const fs::path& game)
         const auto lastRead = lastTextureRead.load(std::memory_order_relaxed);
         if (!jobs.empty() && now >= lastRead && now - lastRead >= 350) {
             auto& job = jobs.front();
-            if (job.textures.empty() || !job.remaining || (!job.retain && warmed >= sessionBudget)) {
+            const bool retain = job.kind != JobKind::Warm;
+            if (job.textures.empty() || !job.remaining || (!retain && warmed >= sessionBudget)) {
                 jobs.pop_front();
                 continue;
             }
@@ -681,14 +742,14 @@ void runWorker(const fs::path& game)
             } else {
                 const auto texture = std::move(job.textures.front());
                 job.textures.pop_front();
-                const auto available = job.retain ? job.remaining : std::min(job.remaining, sessionBudget - warmed);
+                const auto available = retain ? job.remaining : std::min(job.remaining, sessionBudget - warmed);
                 const auto key = texture.relative.native();
-                if (texture.size <= available && (job.retain || cached.insert(key).second)) {
+                if (texture.size <= available && (retain || cached.insert(key).second)) {
                     for (const auto& root : roots) {
                         const auto path = root / texture.relative;
                         std::error_code error;
                         if (!fs::is_regular_file(path, error)) continue;
-                        auto total = job.retain && ioEvent ? loadResident(path, available, ioEvent) : 0;
+                        auto total = retain && ioEvent ? loadResident(path, available, ioEvent, job.kind) : 0;
                         if (!total && warmed < sessionBudget)
                             total = warmFile(path, std::min(available, sessionBudget - warmed), buffer);
                         if (total) {
@@ -729,7 +790,7 @@ void runWorker(const fs::path& game)
 #ifndef FFX_PREFETCH_TEST
 struct ModuleVersion { int major, minor, patch; };
 extern "C" __declspec(dllexport) const char* FF10HgetName() { return "FFX Texture Prefetch Beta"; }
-extern "C" __declspec(dllexport) ModuleVersion FF10HgetVer() { return {0, 5, 0}; }
+extern "C" __declspec(dllexport) ModuleVersion FF10HgetVer() { return {0, 6, 0}; }
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
@@ -773,7 +834,7 @@ int wmain(int argc, wchar_t** argv)
     const auto path = root / sample.relative;
     residentTextures.reserve(maxResidentFiles);
     const auto ioEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!ioEvent || loadResident(path, sample.size, ioEvent) != sample.size) return 12;
+    if (!ioEvent || loadResident(path, sample.size, ioEvent, JobKind::Battle) != sample.size) return 12;
     const auto file = CreateFileW(path.c_str(), FILE_READ_DATA, FILE_SHARE_READ,
                                   nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (file == INVALID_HANDLE_VALUE) return 13;
@@ -793,6 +854,38 @@ int wmain(int argc, wchar_t** argv)
         !ReadFile(file, buffer.data(), 64, &count, nullptr) || count != 32 || residentHits.load() != 1)
         return 18;
     if (!CloseHandle(file) || handleSlot(file).load()) return 19;
+
+    const fs::path generalRelative(L"menu\\fixture.dds.phyre");
+    const auto generalPath = root / generalRelative;
+    if (fs::exists(generalPath)) {
+        const auto generalFile = CreateFileW(generalPath.c_str(), FILE_READ_DATA, FILE_SHARE_READ,
+                                             nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (generalFile == INVALID_HANDLE_VALUE) return 26;
+        const auto beforeNative = nativeCalls.load();
+        if (!ReadFile(generalFile, expected.data(), DWORD(expected.size()), &count, nullptr) ||
+            count != expected.size() || nativeCalls.load() != beforeNative + 1 || generalHits.load() != 0)
+            return 27;
+
+        std::deque<Job> pending;
+        std::unordered_set<std::wstring> alreadyQueued;
+        Bytes allowance = newGeneralBudget;
+        queueGeneralTexture(pending, {root}, generalRelative.native(), alreadyQueued, allowance);
+        queueGeneralTexture(pending, {root}, generalRelative.native(), alreadyQueued, allowance);
+        if (pending.size() != 1 || pending.front().kind != JobKind::General ||
+            allowance != newGeneralBudget - pending.front().remaining) return 28;
+        const auto& request = pending.front();
+        if (loadResident(generalPath, request.remaining, ioEvent, request.kind) != request.remaining ||
+            generalResidentBytes.load() != request.remaining) return 29;
+
+        if (SetFilePointer(generalFile, 0, nullptr, FILE_BEGIN) != 0 ||
+            !ReadFile(generalFile, buffer.data(), DWORD(expected.size()), &count, nullptr) ||
+            count != expected.size() || nativeCalls.load() != beforeNative + 1 ||
+            generalHits.load() != 1 || std::memcmp(expected.data(), buffer.data(), expected.size()) != 0)
+            return 30;
+        CloseHandle(generalFile);
+        std::printf("Normal texture native miss, learned background read, cache hit, and de-duplication passed.\n");
+    }
+
     if (argc == 3) {
         const auto hot = hotJob({root}, readHotSet(fs::path(argv[2])), true);
         if (hot.textures.empty()) return 20;
@@ -800,7 +893,7 @@ int wmain(int argc, wchar_t** argv)
         Bytes loaded = 0;
         for (const auto& texture : hot.textures) {
             if (texture.size > residentBudget - loaded) continue;
-            const auto size = loadResident(root / texture.relative, residentBudget - loaded, ioEvent);
+            const auto size = loadResident(root / texture.relative, residentBudget - loaded, ioEvent, JobKind::Battle);
             if (size != texture.size) return 21;
             loaded += size;
             ++files;
