@@ -1,0 +1,16 @@
+/build/
+/third_party/
+__pycache__/
+*.addon32
+*.dll
+*.exe
+*.exp
+*.hot
+*.lib
+*.log
+*.obj
+*.pdb
+*.csv
+*.dds
+*.phyre
+*.vbf
