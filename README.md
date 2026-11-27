@@ -48,7 +48,13 @@ Copy `build/FFXRuntimeFixes.dll` into the game's `modules` folder to enable thes
 - The game window uses a black background while Direct3D starts. The hook targets the Phyre game window and chains existing window-class hooks.
 - The optional battle sound cue reader skips inaccessible records and forwards valid sound IDs to the game's audio engine. This fix works independently of the FPS mod and checks the expected instructions before patching.
 
-Run `build/runtime-fixes-test.exe "path/to/FFX.exe"` to validate the sound patch against your executable and check the black window class. The test maps the executable as test data and leaves the game unopened.
+### FMV Volume
+
+Install the [FFX-60fps fork](https://github.com/jshethbright/FFX-60fps) with its Config menu enabled. Open the in-game **Config** menu, scroll to **FMV Volume**, and use left or right to adjust the slider. The menu entry uses English text and appears with the Western text languages.
+
+**50** uses the game's original movie playback level, **0** mutes movies, and **100** doubles their audio gain (about +6 dB). The control adjusts the complete movie soundtrack and preserves the game's movie fades and mutes. At higher settings, loud peaks can reach the movie player's existing clipping limit. The setting is saved under `[Audio]` as `FMVVolume` in `modules/config/FFXRuntimeFixes.ini`.
+
+Run `build/runtime-fixes-test.exe "path/to/FFX.exe"` to validate the sound patches, FMV gain and persistence, and the black window class. The test maps the executable as test data and leaves the game unopened.
 
 ## Optional texture and frame profiler
 

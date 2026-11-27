@@ -4,6 +4,8 @@
 #include <windows.h>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
+#include <iterator>
 #ifdef FFX_RUNTIME_FIXES_TEST
 #include <cstdio>
 #endif
@@ -136,9 +138,72 @@ bool installBattleCueGuard(const Image& image)
                         displacement, PAGE_EXECUTE_READWRITE);
 }
 
+volatile LONG movieVolume = 50;
+alignas(8) volatile LONG64 moviePcmScaleBits = 0;
+bool movieVolumeInstalled = false;
+wchar_t runtimeIni[MAX_PATH]{};
+
+int clampMovieVolume(int value)
+{
+    return value < 0 ? 0 : value > 100 ? 100 : value;
+}
+
+void applyMovieVolume(int level)
+{
+    const double scale = 32767.0 * (static_cast<double>(level) / 50.0);
+    LONG64 bits = 0;
+    std::memcpy(&bits, &scale, sizeof bits);
+    InterlockedExchange64(&moviePcmScaleBits, bits);
+    InterlockedExchange(&movieVolume, level);
+}
+
+bool installMovieVolume(const Image& image)
+{
+    // The bundled FMOD Ex clamps channel volume to unity. Instead, scale the
+    // movie decoder's floating-point PCM before its existing signed 16-bit
+    // saturation. FMOD still handles all original movie fades and mutes.
+    constexpr DWORD convertRva = 0x6272C0;
+    constexpr DWORD constantRva = 0x741D70;
+    constexpr BYTE convert[] = {0xD9,0x04,0xB8,0x83,0xEC,0x08,0xDC,0x0D};
+    constexpr BYTE rounding[] = {0xDC,0x05};
+    constexpr BYTE clamp[] = {0x3D,0xFF,0x7F,0x00,0x00,0x7E,0x0F};
+    if (image.nt->OptionalHeader.SizeOfImage < constantRva + sizeof(double) ||
+        std::memcmp(image.base + convertRva, convert, sizeof convert) != 0 ||
+        std::memcmp(image.base + convertRva + 12, rounding, sizeof rounding) != 0 ||
+        std::memcmp(image.base + convertRva + 46, clamp, sizeof clamp) != 0) return false;
+    const auto* stock = image.base + constantRva;
+    double stockScale = 0.0;
+    std::memcpy(&stockScale, stock, sizeof stockScale);
+    if (stockScale != 32767.0) return false;
+    auto* operand = reinterpret_cast<volatile LONG*>(image.base + convertRva + sizeof convert);
+    return replaceDword(operand, reinterpret_cast<LONG>(stock),
+                        reinterpret_cast<LONG>(&moviePcmScaleBits), PAGE_EXECUTE_READWRITE);
+}
+
+// The in-game Config menu reads with -1 and sets 0–100. The module owns persistence.
+int movieVolumeSetting(int value)
+{
+    if (!movieVolumeInstalled) return -1;
+    const int current = InterlockedCompareExchange(&movieVolume, 0, 0);
+    if (value < 0 || value == current) return current;
+    value = clampMovieVolume(value);
+    wchar_t text[8]{};
+    std::swprintf(text, std::size(text), L"%d", value);
+    if (!WritePrivateProfileStringW(L"Audio", L"FMVVolume", text, runtimeIni)) return current;
+    applyMovieVolume(value);
+    return value;
+}
+
 #ifdef FFX_RUNTIME_FIXES_TEST
 unsigned calls = 0;
 int cueId = 0, cueFlags = -1;
+double moviePcmScale()
+{
+    const LONG64 bits = InterlockedCompareExchange64(&moviePcmScaleBits, 0, 0);
+    double scale = 0.0;
+    std::memcpy(&scale, &bits, sizeof scale);
+    return scale;
+}
 
 void __cdecl verifyCue(int id, int flags)
 {
@@ -158,7 +223,7 @@ int wmain(int argc, wchar_t** argv)
     auto game = LoadLibraryExW(argv[1], nullptr, DONT_RESOLVE_DLL_REFERENCES);
     const auto image = x86Image(game);
     if (!image.base || !registerClassImport(image) || !installBattleCueGuard(image) ||
-        installBattleCueGuard(image)) return 2;
+        installBattleCueGuard(image) || !installMovieVolume(image) || installMovieVolume(image)) return 2;
     FreeLibrary(game);
 
     const auto harness = x86Image(GetModuleHandleW(nullptr));
@@ -191,7 +256,22 @@ int wmain(int argc, wchar_t** argv)
     if (calls != 0) return 7;
     playOptionalCue(&valid, 99);
     if (calls != 1 || cueId != -123 || cueFlags != 0) return 8;
-    std::puts("FFX signatures, black game window, other classes, and valid and invalid sound cues passed.");
+
+    if (movieVolumeSetting(-1) != -1 || clampMovieVolume(-20) != 0 ||
+        clampMovieVolume(140) != 100) return 9;
+    wchar_t directory[MAX_PATH]{};
+    if (!GetTempPathW(MAX_PATH, directory) || !GetTempFileNameW(directory, L"ffx", 0, runtimeIni)) return 10;
+    movieVolumeInstalled = true;
+    applyMovieVolume(50);
+    const bool volumePassed =
+        movieVolumeSetting(-1) == 50 && moviePcmScale() == 32767.0 &&
+        movieVolumeSetting(25) == 25 && moviePcmScale() == 16383.5 &&
+        movieVolumeSetting(100) == 100 &&
+        GetPrivateProfileIntW(L"Audio", L"FMVVolume", 50, runtimeIni) == 100 &&
+        moviePcmScale() == 65534.0 && movieVolumeSetting(0) == 0 && moviePcmScale() == 0.0;
+    DeleteFileW(runtimeIni);
+    if (!volumePassed) return 11;
+    std::puts("FFX signatures, startup window, battle cues, and persistent FMV gain passed.");
     return 0;
 }
 #else
@@ -205,7 +285,12 @@ extern "C" __declspec(dllexport) const char* FF10HgetName()
     return "FFX Runtime Fixes (inactive)";
 }
 
-extern "C" __declspec(dllexport) ModuleVersion FF10HgetVer() { return {0, 1, 0}; }
+extern "C" __declspec(dllexport) ModuleVersion FF10HgetVer() { return {0, 2, 0}; }
+
+extern "C" __declspec(dllexport) int __cdecl FFXGetSetFmvVolume(int value)
+{
+    return movieVolumeSetting(value);
+}
 
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
 {
@@ -222,6 +307,15 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
                                 reinterpret_cast<LPCWSTR>(&registerWindow), &pinned)) return TRUE;
         blackWindow = installBlackWindow(image);
         guardedCue = installBattleCueGuard(image);
+        constexpr wchar_t suffix[] = L"modules\\config\\FFXRuntimeFixes.ini";
+        const size_t directoryLength = length - 7; // includes the backslash before FFX.exe
+        if (directoryLength + std::size(suffix) <= MAX_PATH) {
+            std::wmemcpy(runtimeIni, path, directoryLength);
+            std::wmemcpy(runtimeIni + directoryLength, suffix, std::size(suffix));
+            applyMovieVolume(clampMovieVolume(static_cast<int>(
+                GetPrivateProfileIntW(L"Audio", L"FMVVolume", 50, runtimeIni))));
+            movieVolumeInstalled = installMovieVolume(image);
+        }
     }
     return TRUE;
 }
