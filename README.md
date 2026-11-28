@@ -41,6 +41,23 @@ $menu = New-Item -ItemType Directory -Path (Join-Path $fixture 'menu')
 
 Offline validation verifies file behavior, including a normal texture that first falls through to the native reader and later hits the cache. Gameplay performance depends on when predicted textures finish loading.
 
+## Shader reuse
+
+FFX creates the same shaders and input layouts again for every model it loads. A session has thousands of these creates but only a few hundred distinct objects. Each create compiles in the graphics driver. On AMD's D3D11 driver the compile holds a device lock, and the render thread waits behind it, so frames hitch when characters or enemies load. `FFXShaderReuse.dll` returns the existing object for a create with identical bytecode and, for input layouts, identical elements. Only new shaders are compiled. Shaders and layouts cannot be changed after creation, so reuse is safe. The module keeps one reference to each object for the session.
+
+The hooks patch the device vtable and work with the system D3D11 runtime, ReShade, and DXVK. Under DXVK, which compiles shaders in the background, the module still skips the duplicate creates.
+
+Copy `build/FFXShaderReuse.dll` into `modules`. `ffx-shader-reuse.log` in the game directory records hook status and the reuse count. To disable logging or the module, use `modules/config/FFXShaderReuse.ini`.
+
+```ini
+[General]
+Enabled=1
+[Diagnostics]
+Logging=0
+```
+
+`build/shader-reuse-test.exe` creates a Direct3D 11 device, compiles test shaders, and checks that a duplicate create returns the same object while different bytecode or elements create a new one.
+
 ## Optional startup and battle fixes
 
 Copy `build/FFXRuntimeFixes.dll` into the game's `modules` folder to enable these fixes through the FFX module loader.

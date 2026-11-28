@@ -15,4 +15,8 @@ if errorlevel 1 exit /b 1
 cl /nologo /W4 /WX /EHsc /std:c++17 /O2 /MT /LD /Fo"%OUT%\FFXRuntimeFixes.obj" "%ROOT%FFXRuntimeFixes.cpp" /link user32.lib gdi32.lib /IMPLIB:"%OUT%\FFXRuntimeFixes.lib" /OUT:"%OUT%\FFXRuntimeFixes.dll"
 if errorlevel 1 exit /b 1
 cl /nologo /W4 /WX /EHsc /std:c++17 /O2 /MT /DFFX_RUNTIME_FIXES_TEST /Fo"%OUT%\runtime-fixes-test.obj" /Fe"%OUT%\runtime-fixes-test.exe" "%ROOT%FFXRuntimeFixes.cpp" /link user32.lib gdi32.lib
+cl /nologo /W4 /WX /EHsc /std:c++17 /O2 /MT /LD /Fo"%OUT%\FFXShaderReuse.obj" "%ROOT%FFXShaderReuse.cpp" /link /IMPLIB:"%OUT%\FFXShaderReuse.lib" /OUT:"%OUT%\FFXShaderReuse.dll"
+if errorlevel 1 exit /b 1
+cl /nologo /W4 /WX /EHsc /std:c++17 /O2 /MT /DFFX_SHADER_REUSE_TEST /Fo"%OUT%\shader-reuse-test.obj" /Fe"%OUT%\shader-reuse-test.exe" "%ROOT%FFXShaderReuse.cpp"
+if errorlevel 1 exit /b 1
 exit /b %ERRORLEVEL%
